@@ -1,0 +1,127 @@
+import requests
+import json
+import psycopg2
+
+from airflow import DAG
+from airflow.operators.python_operator import PythonOperator
+from datetime import datetime
+# Define the database connection parameters
+db_host = "localhost"
+db_port = 5432
+db_name = "airflow"
+db_user = "postgres"
+db_password = "password"
+
+default_args = {
+    'owner': 'kelompok2',
+    'start_date': datetime(2023, 10, 21),
+    'schedule_interval': '0 4 * * *',  # Berjalan setiap hari pukul 4 pagi
+}
+
+# Define the Airflow DAG
+dag = DAG(
+    dag_id="openaq_data_pipeline",
+    default_args=default_args, 
+    start_date=datetime(2023, 10, 23),
+    schedule_interval="@daily",
+    catchup=False,
+)
+
+# Define the task to ingest the data from the OpenAQ API
+@dag.task
+def ingest_data():
+    """Ingest data from the OpenAQ API."""
+
+    # Make a GET request to the OpenAQ API
+    response = requests.get("https://api.openaq.org/v2/locations?limit=100&page=1&offset=0&sort=desc&radius=1000&country=ID&location=Jakarta%20Central&order_by=lastUpdate&dump_raw=false")
+    
+    headers = {"accept": "application/json"}
+    # Parse the JSON response from the API
+    
+    response = requests.get(url, headers=headers)
+    
+    data_to_send = response.json()
+
+    # Gunakan XComArg untuk mengirim data
+    return XComArg("data_to_send", data_to_send)
+
+    #print(response.text)
+    #data = json.loads(response.content)
+
+    # Return the data
+    #return data
+
+# Define the task to transform the data
+@dag.task
+def transform_data(data):
+    """Transform the data to the desired format for the database table."""
+    # Mengambil data dari tugas sebelumnya (ingest_data) menggunakan XCom
+    data_to_transform = data['ti'].xcom_pull(task_ids='ingest_data')
+    # Filter the data to only include data from Jakarta, Indonesia
+    filtered_data = [d for d in data if d["location"] == "Jakarta,ID"]
+
+    # Transform the data to the desired format for the database table
+    transformed_data = []
+    for d in filtered_data:
+        transformed_data.append({
+            "date_time": d["date_time"],
+            "pm2_5": d["parameters"]["pm2_5"],
+            "pm10": d["parameters"]["pm10"],
+            "o3": d["parameters"]["o3"],
+            "no2": d["parameters"]["no2"],
+            "so2": d["parameters"]["so2"],
+            "co": d["parameters"]["co"],
+        })
+
+#     # Return the transformed data
+    return transformed_data
+
+# Define the task to store the transformed data in the PostgreSQL database
+@dag.task
+def store_data(data):
+    """Store the transformed data in the PostgreSQL database."""
+
+    # Create a connection to the PostgreSQL database
+    conn = psycopg2.connect(
+        host=db_host, port=db_port, database=db_name, user=db_user, password=db_password
+    )
+
+    # Create a new table in the database to store the transformed data
+    cur = conn.cursor()
+    cur.execute(
+        "CREATE TABLE IF NOT EXISTS air_quality_jakarta (date_time TIMESTAMPTZ, pm2_5 NUMERIC, pm10 NUMERIC, o3 NUMERIC, no2 NUMERIC, so2 NUMERIC, co NUMERIC)"
+    )
+    conn.commit()
+
+# Insert the transformed data into the database table
+    cur.executemany(
+        "INSERT INTO air_quality_jakarta (date_time, pm2_5, pm10, o3, no2, so2, co) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+        data,
+    )
+    conn.commit()
+
+    # Close the connection to the database
+    cur.close()
+    conn.close()
+    
+# Tasks
+ingest_data = PythonOperator(
+    task_id='ingest_data',
+    python_callable=ingest_data,
+    dag=dag,
+)
+
+transform_data = PythonOperator(
+    task_id='transform_data',
+    python_callable=transform_data,
+    dag=dag,
+)
+
+store_data = PythonOperator(
+    task_id='store_data',
+    python_callable=store_data,
+    dag=dag,
+)
+
+# Set the dependencies between the tasks
+ingest_data >> transform_data >> store_data
